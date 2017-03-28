@@ -3,6 +3,7 @@ package main
 
 import (
 	//"encoding/hex"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -13,8 +14,10 @@ import (
 
 	//"github.com/mattn/davfs"
 	"golang.org/x/net/webdav"
+	//"github.com/golang/net/webdav"
 	"gopkg.in/errgo.v1"
 	oradrv "gopkg.in/goracle.v1/oracle"
+	//"github.com/rana/ora"
 )
 
 type Driver struct {
@@ -158,6 +161,7 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (webdav.
 			cur := conn.NewCursor()
 			defer cur.Close()
 			if err := cur.Execute(`begin webdav.create_file(:1); end;`, []interface{}{name}, nil); err != nil {
+				fmt.Println("--------\n", err.Error())
 				return err
 			}
 			return nil
@@ -289,7 +293,7 @@ func (fs *FileSystem) stat(name string) (os.FileInfo, error) {
 		if len(rows) == 0 {
 			return os.ErrNotExist
 		}
-
+		fmt.Println("fmodified = ", rows[0][3].(time.Time).Format(time.RFC3339Nano))
 		fi = FileInfo{
 			name:     rows[0][0].(string),
 			size:     int64(rows[0][1].(int32)),
