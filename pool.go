@@ -2,14 +2,16 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
-	"gopkg.in/goracle.v1/oracle"
+	//"gopkg.in/goracle.v1/oracle"
+	"gopkg.in/rana/ora.v4"
 )
 
 type Db interface {
-	Do(fn func(conn *oracle.Connection) error) error
+	Do(fn func(ses *ora.Ses) error) error
 }
 
 type db struct {
@@ -17,7 +19,9 @@ type db struct {
 	userpass string
 	sid      string
 	timeout  time.Duration
-	conn     *oracle.Connection
+	env      *ora.Env
+	srv      *ora.Srv
+	ses      *ora.Ses
 	tm       *time.Timer
 	sync.Mutex
 }
@@ -31,7 +35,7 @@ func NewDb(username, userpass, sid string, timeout time.Duration) Db {
 	}
 }
 
-func (p *db) Do(fn func(conn *oracle.Connection) error) error {
+func (p *db) Do(fn func(ses *ora.Ses) error) error {
 	var err error
 	p.Lock()
 	defer p.Unlock()
@@ -46,10 +50,7 @@ func (p *db) Do(fn func(conn *oracle.Connection) error) error {
 						func() {
 							p.Lock()
 							defer p.Unlock()
-							if p.conn != nil {
-								p.conn.Free(true)
-								p.conn = nil
-							}
+							p.closeSes()
 							// Инициируем следующий тик через timeout
 							p.tm.Reset(p.timeout)
 						}()
@@ -63,28 +64,50 @@ func (p *db) Do(fn func(conn *oracle.Connection) error) error {
 	p.tm.Stop()
 	defer p.tm.Reset(p.timeout)
 
-	if p.conn != nil {
-		if !p.conn.IsConnected() {
-			p.conn.Free(true)
-			p.conn = nil
-		} else {
-			if err := p.conn.Ping(); err != nil {
-				p.conn.Close()
-				p.conn.Free(true)
-				p.conn = nil
-			}
-		}
-	}
+	p.closeSes()
 
-	if p.conn == nil {
-		p.conn, err = oracle.NewConnection(p.username, p.userpass, p.sid, false)
+	if p.ses == nil {
+		p.env, p.srv, p.ses, err = ora.NewEnvSrvSes(fmt.Sprintf("%s/%s@%s", p.username, p.userpass, p.sid))
 		if err != nil {
-			if p.conn != nil {
-				p.conn.Free(true)
-			}
-			p.conn = nil
+			p.closeSes()
 			return err
 		}
 	}
-	return fn(p.conn)
+	return fn(p.ses)
 }
+
+func (p *db) closeSes() {
+	if p.ses != nil {
+		p.ses.Close()
+		p.ses = nil
+	}
+	if p.srv != nil {
+		p.srv.Close()
+		p.srv = nil
+	}
+	if p.env != nil {
+		p.env.Close()
+		p.env = nil
+	}
+}
+
+//env, err := ora.OpenEnv()
+//	defer env.Close()
+//	if err != nil {
+//		panic(err)
+//	}
+//	srvCfg := ora.SrvCfg{Dblink: "orcl"}
+//	srv, err := env.OpenSrv(&srvCfg)
+//	defer srv.Close()
+//	if err != nil {
+//		panic(err)
+//	}
+//	sesCfg := ora.SesCfg{
+//		Username: "test",
+//		Password: "test",
+//	}
+//	ses, err := srv.OpenSes(sesCfg)
+//	defer ses.Close()
+//	if err != nil {
+//		panic(err)
+//	}

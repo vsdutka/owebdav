@@ -3,8 +3,10 @@ package main
 
 import (
 	//"encoding/hex"
+	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"path"
@@ -12,12 +14,14 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/context"
+
 	//"github.com/mattn/davfs"
 	"golang.org/x/net/webdav"
 	//"github.com/golang/net/webdav"
 	"gopkg.in/errgo.v1"
-	oradrv "gopkg.in/goracle.v1/oracle"
-	//"github.com/rana/ora"
+	//oradrv "gopkg.in/goracle.v1/oracle"
+	"gopkg.in/rana/ora.v4"
 )
 
 type Driver struct {
@@ -45,13 +49,14 @@ type File struct {
 	name     string
 	off      int64
 	size     int64
+	body     []byte
 	children []os.FileInfo
 }
 
 func (d *Driver) Mount(sid, username, userpass string, timeout time.Duration, debug bool) (webdav.FileSystem, error) {
 	db := NewDb(username, userpass, sid, timeout)
 	// Проверяем корректность имени пользователя, пароля и строки соединения
-	if err := db.Do(func(conn *oradrv.Connection) error { return nil }); err != nil {
+	if err := db.Do(func(ses *ora.Ses) error { return nil }); err != nil {
 		return nil, err
 	}
 	return &FileSystem{
@@ -85,7 +90,7 @@ func clearName(name string) (string, error) {
 	return name, nil
 }
 
-func (fs *FileSystem) Mkdir(name string, perm os.FileMode) error {
+func (fs *FileSystem) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
 	//	fs.mu.Lock()
 	//	defer fs.mu.Unlock()
 
@@ -123,7 +128,7 @@ func (fs *FileSystem) Mkdir(name string, perm os.FileMode) error {
 	return errgo.New("Функция создания папки не поддерживается")
 }
 
-func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (webdav.File, error) {
+func (fs *FileSystem) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -154,14 +159,10 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (webdav.
 			}
 			fs.removeAll(name)
 		}
-		if err != nil {
-			log.Println("err ", err, name)
-		}
-		if err := fs.db.Do(func(conn *oradrv.Connection) error {
-			cur := conn.NewCursor()
-			defer cur.Close()
-			if err := cur.Execute(`begin webdav.create_file(:1); end;`, []interface{}{name}, nil); err != nil {
-				fmt.Println("--------\n", err.Error())
+
+		if err := fs.db.Do(func(ses *ora.Ses) error {
+			if _, err = ses.PrepAndExe(`begin webdav.create_file(:1); end;`, name); err != nil {
+				fmt.Println("--------\nCreate", err.Error())
 				return err
 			}
 			return nil
@@ -169,7 +170,7 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (webdav.
 		}); err != nil {
 			return nil, err
 		}
-		return &File{fs, name, 0, 0, nil}, nil
+		return &File{fs, name, 0, 0, nil, nil}, nil
 	}
 
 	fi, err := fs.stat(name)
@@ -179,7 +180,7 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (webdav.
 	if !strings.HasSuffix(name, "/") && fi.IsDir() {
 		name += "/"
 	}
-	return &File{fs, name, 0, fi.Size(), nil}, nil
+	return &File{fs, name, 0, fi.Size(), nil, nil}, nil
 }
 
 func (fs *FileSystem) removeAll(name string) error {
@@ -192,11 +193,10 @@ func (fs *FileSystem) removeAll(name string) error {
 		return os.ErrPermission
 	}
 
-	if err := fs.db.Do(func(conn *oradrv.Connection) error {
-		cur := conn.NewCursor()
-		defer cur.Close()
-		if err := cur.Execute(`begin webdav.delete_file(:1); end;`, []interface{}{name}, nil); err != nil {
-			return os.ErrPermission
+	if err := fs.db.Do(func(ses *ora.Ses) error {
+		if _, err = ses.PrepAndExe(`begin webdav.delete_file(:1); end;`, name); err != nil {
+			fmt.Println("--------\nDelete", err.Error())
+			return err
 		}
 		return nil
 	}); err != nil {
@@ -206,7 +206,7 @@ func (fs *FileSystem) removeAll(name string) error {
 	return nil
 }
 
-func (fs *FileSystem) RemoveAll(name string) error {
+func (fs *FileSystem) RemoveAll(ctx context.Context, name string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -217,7 +217,7 @@ func (fs *FileSystem) RemoveAll(name string) error {
 	return fs.removeAll(name)
 }
 
-func (fs *FileSystem) Rename(oldName, newName string) error {
+func (fs *FileSystem) Rename(ctx context.Context, oldName, newName string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -246,10 +246,12 @@ func (fs *FileSystem) Rename(oldName, newName string) error {
 	if err == nil {
 		return os.ErrExist
 	}
-	return fs.db.Do(func(conn *oradrv.Connection) error {
-		cur := conn.NewCursor()
-		defer cur.Close()
-		return cur.Execute(`begin webdav.rename_file(:1, :2); end;`, []interface{}{oldName, newName}, nil)
+	return fs.db.Do(func(ses *ora.Ses) error {
+		if _, err = ses.PrepAndExe(`begin webdav.rename_file(:1, :2); end;`, oldName, newName); err != nil {
+			fmt.Println("--------\nRename", err.Error())
+			return err
+		}
+		return nil
 	})
 }
 
@@ -278,31 +280,30 @@ func (fs *FileSystem) stat(name string) (os.FileInfo, error) {
 	}
 
 	var fi FileInfo
-	if err := fs.db.Do(func(conn *oradrv.Connection) error {
-		cur := conn.NewCursor()
-		defer cur.Close()
-
-		if err := cur.Execute(`select fname, fsize, to_char(fmode), fmodified from table(webdav.dir(:1)) where fname = :2`, []interface{}{dir, name}, nil); err != nil {
-			return err
-		}
-
-		rows, err := cur.FetchAll()
+	if err := fs.db.Do(func(ses *ora.Ses) error {
+		// fetch records
+		stm, err := ses.Prep(`select fname, fsize, to_char(fmode), fmodified from table(webdav.dir(:1)) where fname = :2`, ora.S, ora.U64, ora.S, ora.T)
+		defer stm.Close()
 		if err != nil {
 			return err
 		}
-		if len(rows) == 0 {
-			return os.ErrNotExist
+		rset, err := stm.Qry(dir, name)
+		if err != nil {
+			return err
 		}
-		fmt.Println("fmodified = ", rows[0][3].(time.Time).Format(time.RFC3339Nano))
-		fi = FileInfo{
-			name:     rows[0][0].(string),
-			size:     int64(rows[0][1].(int32)),
-			mod_time: rows[0][3].(time.Time),
+
+		for rset.Next() {
+			fi = FileInfo{
+				name:     rset.Row[0].(string),
+				size:     int64(rset.Row[1].(uint64)),
+				mod_time: rset.Row[3].(time.Time).UTC(),
+			}
+			if rset.Row[2].(string) != "0" {
+				fi.mode = os.ModeDir
+			}
+			return nil
 		}
-		if rows[0][2].(string) != "0" {
-			fi.mode = os.ModeDir
-		}
-		return nil
+		return os.ErrNotExist
 	}); err != nil {
 		return nil, err
 	}
@@ -310,11 +311,10 @@ func (fs *FileSystem) stat(name string) (os.FileInfo, error) {
 	if fi.name == "" {
 		fi.name = "/"
 	}
-
 	return &fi, nil
 }
 
-func (fs *FileSystem) Stat(name string) (os.FileInfo, error) {
+func (fs *FileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -336,26 +336,14 @@ func (f *File) Write(p []byte) (int, error) {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
 
+	f.body = nil
 	if f.fs.Debug {
 		log.Printf("File.Write %v", f.name)
 	}
-	bufLen := len(p)
-	if err := f.fs.db.Do(func(conn *oradrv.Connection) error {
-		cur := conn.NewCursor()
-		defer cur.Close()
-
-		if bufLen > 32767 {
-			bufLen = 32767
-		}
-
-		in, err := cur.NewVariable(0, oradrv.BinaryVarType, uint(bufLen))
-		if err != nil {
-			return err
-		}
-		in.SetValue(0, p[:bufLen])
-
-		err = cur.Execute(`begin webdav.write_file(:1, :2, :3, :4); end;`, []interface{}{f.name, 1 + f.off, bufLen, in}, nil)
-		if err != nil {
+	bufLen := uint64(len(p))
+	if err := f.fs.db.Do(func(ses *ora.Ses) error {
+		if _, err := ses.PrepAndExe(`begin webdav.write_file(:1, :2, :3, :4); end;`, f.name, 1+f.off, bufLen, p[:bufLen]); err != nil {
+			fmt.Println("--------\nWrite", err.Error())
 			return err
 		}
 		f.off += int64(bufLen)
@@ -364,14 +352,14 @@ func (f *File) Write(p []byte) (int, error) {
 		return 0, err
 	}
 
-	return bufLen, nil
+	return int(bufLen), nil
 }
 
 func (f *File) Close() error {
 	if f.fs.Debug {
 		log.Printf("File.Close %v", f.name)
 	}
-
+	f.body = nil
 	return nil
 }
 
@@ -383,52 +371,40 @@ func (f *File) Read(p []byte) (int, error) {
 		log.Printf("File.Read %v. offset = %v, len = %v", f.name, 1+f.off, len(p))
 	}
 
-	buf, err := func() ([]byte, error) {
-		var buf []byte
-		if err := f.fs.db.Do(func(conn *oradrv.Connection) error {
-			cur := conn.NewCursor()
-			defer cur.Close()
-
-			out, err := cur.NewVariable(0, oradrv.BinaryVarType, 32767)
-			if err != nil {
+	err := func() error {
+		if f.body == nil {
+			if err := f.fs.db.Do(func(ses *ora.Ses) error {
+				stm, err := ses.Prep(`begin webdav.read_file_all(:1, :2); end;`, ora.S, ora.L)
+				defer stm.Close()
+				if err != nil {
+					return err
+				}
+				lob := ora.Lob{}
+				_, err = stm.Exe(&f.name, &lob)
+				if err != nil {
+					return err
+				}
+				f.body, err = lob.Bytes()
+				if err != nil {
+					return err
+				}
+				return nil
+			}); err != nil {
 				return err
 			}
-
-			lenVar, err1 := cur.NewVariable(0, oradrv.Int32VarType, 0)
-			if err1 != nil {
-				return err
-			}
-			lenVar.SetValue(0, len(p))
-
-			err = cur.Execute(`begin webdav.read_file(:1, :2, :3, :4); end;`, []interface{}{f.name, 1 + f.off, lenVar, out}, nil)
-			if err != nil {
-				return err
-			}
-
-			val, err2 := out.GetValue(0)
-			if err2 != nil {
-				return err2
-			}
-			buf, _ = val.([]uint8)
-
-			return nil
-		}); err != nil {
-			return nil, err
 		}
-		return buf, nil
+		return nil
 	}()
 
 	if err != nil {
 		return 0, err
 	}
-
-	bl := copy(p, buf)
-
-	f.off += int64(bl)
-	if bl == 0 {
-		return 0, io.EOF
+	r := bytes.NewReader(f.body)
+	bl, err := r.ReadAt(p, f.off)
+	if err != nil {
+		return bl, err
 	}
-
+	f.off += int64(bl)
 	return bl, nil
 }
 
@@ -441,26 +417,24 @@ func (f *File) Readdir(count int) ([]os.FileInfo, error) {
 	}
 
 	if f.children == nil {
-		if err := f.fs.db.Do(func(conn *oradrv.Connection) error {
-			cur := conn.NewCursor()
-			defer cur.Close()
-
-			if err := cur.Execute(`select fname, fsize, to_char(fmode), fmodified from table(webdav.dir(:1))`, []interface{}{f.name}, nil); err != nil {
+		if err := f.fs.db.Do(func(ses *ora.Ses) error {
+			stm, err := ses.Prep(`select fname, fsize, to_char(fmode), fmodified from table(webdav.dir(:1))`, ora.S, ora.U64, ora.S, ora.T)
+			defer stm.Close()
+			if err != nil {
 				return err
 			}
-			rows, err := cur.FetchAll()
-
+			rset, err := stm.Qry(&f.name)
 			if err != nil {
 				return err
 			}
 			f.children = []os.FileInfo{}
-			for _, row := range rows {
+			for rset.Next() {
 				fi := &FileInfo{
-					name:     row[0].(string),
-					size:     int64(row[1].(int32)),
-					mod_time: row[3].(time.Time),
+					name:     rset.Row[0].(string),
+					size:     int64(rset.Row[1].(uint64)),
+					mod_time: rset.Row[3].(time.Time),
 				}
-				if row[2].(string) != "0" {
+				if rset.Row[2].(string) != "0" {
 					fi.mode = os.ModeDir
 				}
 
@@ -518,6 +492,7 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 		f.off = f.size
 	}
 	f.off += offset
+
 	return f.off, err
 }
 
@@ -530,6 +505,41 @@ func (f *File) Stat() (os.FileInfo, error) {
 	}
 
 	return f.fs.stat(f.name)
+}
+
+func (f *File) ReadFrom(r io.Reader) (n int64, err error) {
+	if f.fs.Debug {
+		log.Printf("File.ReadFrom %v", f.name)
+	}
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+
+	b, err := ioutil.ReadAll(r)
+	if err != nil {
+		return 0, err
+	}
+
+	if err := f.fs.db.Do(func(ses *ora.Ses) error {
+
+		stm, err := ses.Prep(`begin webdav.write_file_all(:1, :2); end;`, ora.S, ora.L)
+		defer stm.Close()
+		if err != nil {
+			return err
+		}
+		lob := ora.Lob{Reader: bytes.NewReader(b)}
+		_, err = stm.Exe(&f.name, &lob)
+		if err != nil {
+			fmt.Println("--------\nWrite", err.Error())
+			return err
+		}
+		f.body = b
+		f.off = int64(len(b))
+		f.size = f.off
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return int64(len(b)), nil
 }
 
 var skippedNames map[string]bool = map[string]bool{
