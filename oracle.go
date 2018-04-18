@@ -28,10 +28,6 @@ type Driver struct {
 }
 
 type FileSystem struct {
-	//	dbconn   string
-	//	username string
-	//	userpass string
-	//	conn     *oradrv.Connection
 	mu    sync.Mutex
 	db    Db
 	Debug bool
