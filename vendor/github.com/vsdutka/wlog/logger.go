@@ -34,7 +34,7 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 var logChan = make(chan string, 10000)
 
 func init() {
-	basePath := ".\\"
+	basePath := "./"
 	exeName, err := osext.Executable()
 
 	if err == nil {
@@ -64,7 +64,7 @@ func init() {
 						if logFile != nil {
 							logFile.Close()
 						}
-						fileName := basePath + "\\log\\ex" + time.Now().Format("2006_01_02") + ".log"
+						fileName := basePath + "/log/ex" + time.Now().Format("2006_01_02") + ".log"
 						dir, _ := filepath.Split(fileName)
 						os.MkdirAll(dir, os.ModeDir)
 
