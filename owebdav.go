@@ -2,8 +2,6 @@
 package main
 
 import (
-	"fmt"
-"os"
 	"flag"
 	"log"
 	"net/http"
@@ -37,7 +35,6 @@ func errorString(err error) string {
 }
 
 func main() {
-	fmt.Println("Start with params: ", os.Args);
 	flag.Parse()
 
 	log.SetOutput(colorable.NewColorableStderr())
